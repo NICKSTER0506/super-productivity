@@ -37,10 +37,12 @@ import * as http from 'node:http';
 import type { Socket } from 'node:net';
 
 vi.mock('../../src/auth', () => ({
-  // No token is sent at all in this test, so the route rejects before
-  // verifyToken is even reached — this mock only has to exist to satisfy the
-  // module import.
-  verifyToken: async () => ({ valid: false, reason: 'unused in this test' }),
+  verifyToken: async (token: string) => {
+    if (token === 'auth-error') {
+      throw new Error('Authentication unavailable');
+    }
+    return { valid: false, reason: 'Invalid token' };
+  },
 }));
 
 vi.mock('../../src/logger', () => ({
@@ -58,6 +60,7 @@ const { wsRoutes, WS_REJECTED_SOCKET_GRACE_MS } =
 interface RawUpgrade {
   statusCode: number;
   socket: Socket;
+  chunks: Buffer[];
 }
 
 /** Performs a WebSocket upgrade by hand and hands back the raw TCP socket,
@@ -79,12 +82,17 @@ const openRawUpgrade = (port: number, path: string): Promise<RawUpgrade> =>
         'Sec-WebSocket-Version': '13',
       },
     });
-    req.on('upgrade', (res, socket) => {
-      resolve({ statusCode: res.statusCode ?? 0, socket });
+    req.on('upgrade', (res, socket, head) => {
+      // The close frame can arrive with the upgrade or in later TCP chunks.
+      // Read it without replying, leaving the WebSocket handshake incomplete.
+      const chunks = [head];
+      socket.on('data', (chunk: Buffer) => chunks.push(chunk));
+      resolve({ statusCode: res.statusCode ?? 0, socket, chunks });
     });
     req.on('response', (res) => {
       // e.g. a 429 from the rate limiter — no 'upgrade' event will fire for
       // this, so surface it instead of hanging the test.
+      res.resume();
       reject(new Error(`Expected a WebSocket upgrade, got HTTP ${res.statusCode}`));
     });
     req.on('error', reject);
@@ -93,48 +101,96 @@ const openRawUpgrade = (port: number, path: string): Promise<RawUpgrade> =>
 
 const waitForRawClose = (socket: Socket, timeoutMs: number): Promise<boolean> =>
   new Promise((resolve) => {
-    socket.once('close', () => resolve(true));
-    setTimeout(() => resolve(false), timeoutMs);
+    const onClose = (): void => {
+      clearTimeout(timer);
+      resolve(true);
+    };
+    const timer = setTimeout(() => {
+      socket.off('close', onClose);
+      resolve(false);
+    }, timeoutMs);
+    socket.once('close', onClose);
   });
 
 describe('WebSocket rejected-socket teardown (real socket, uncooperative peer) - #9885', () => {
   let app: FastifyInstance | undefined;
+  let rawSocket: Socket | undefined;
 
   afterEach(async () => {
+    // Also release the uncooperative peer when an assertion fails, so server
+    // teardown does not wait for ws's 30-second timeout in the red test.
+    rawSocket?.destroy();
+    rawSocket = undefined;
     if (app) {
       await app.close();
       app = undefined;
     }
   });
 
-  it('terminates a rejected socket within the grace period, not ws’s 30s CLOSE_TIMEOUT', async () => {
-    app = Fastify({ logger: false });
-    await app.register(rateLimit, { max: 500, timeWindow: '15 minutes' });
-    await app.register(websocket);
-    await app.register(wsRoutes, { prefix: '/api/sync' });
-    const httpUrl = await app.listen({ port: 0, host: '127.0.0.1' });
-    const port = Number(new URL(httpUrl).port);
+  it.each([
+    {
+      rejection: 'missing token',
+      path: '/api/sync/ws',
+      code: 4001,
+      reason: 'Missing token',
+    },
+    {
+      rejection: 'invalid clientId',
+      path: '/api/sync/ws?token=invalid&clientId=invalid!',
+      code: 4001,
+      reason: 'Invalid clientId',
+    },
+    {
+      rejection: 'invalid token',
+      path: '/api/sync/ws?token=invalid&clientId=valid-client',
+      code: 4003,
+      reason: 'Invalid token',
+    },
+    {
+      rejection: 'internal authentication error',
+      path: '/api/sync/ws?token=auth-error&clientId=valid-client',
+      code: 1011,
+      reason: 'Internal error',
+    },
+  ])(
+    'preserves the close frame and promptly terminates after $rejection',
+    async ({ path, code, reason }) => {
+      app = Fastify({ logger: false });
+      await app.register(rateLimit, { max: 500, timeWindow: '15 minutes' });
+      await app.register(websocket);
+      await app.register(wsRoutes, { prefix: '/api/sync' });
+      const httpUrl = await app.listen({ port: 0, host: '127.0.0.1' });
+      const port = Number(new URL(httpUrl).port);
 
-    // No token in the querystring -> the route rejects with 4001 ("Missing
-    // token") immediately after completing the upgrade.
-    const start = Date.now();
-    const { statusCode, socket } = await openRawUpgrade(port, '/api/sync/ws');
+      const start = Date.now();
+      const { statusCode, socket, chunks } = await openRawUpgrade(port, path);
+      rawSocket = socket;
 
-    // The vulnerability's precondition: the upgrade completes BEFORE auth is
-    // checked, so an unauthenticated caller still gets a real socket.
-    expect(statusCode).toBe(101);
+      // The vulnerability's precondition: the upgrade completes BEFORE auth is
+      // checked, so an unauthenticated caller still gets a real socket.
+      expect(statusCode).toBe(101);
 
-    // Deliberately do nothing further with `socket` — no close frame is ever
-    // echoed back. Historically this pinned the server-side TCP connection
-    // open for ~30s (ws's CLOSE_TIMEOUT). Give this a generous safety margin
-    // over the grace period so a regression to the old behavior fails
-    // clearly rather than the test hanging until the runner's own timeout.
-    const safetyNetMs = WS_REJECTED_SOCKET_GRACE_MS + 5_000;
-    const closed = await waitForRawClose(socket, safetyNetMs);
-    const elapsedMs = Date.now() - start;
+      // Deliberately do nothing further with `socket` — no close frame is ever
+      // echoed back. Historically this pinned the server-side TCP connection
+      // open for ~30s (ws's CLOSE_TIMEOUT). Give this a generous safety margin
+      // over the grace period so a regression to the old behavior fails
+      // clearly rather than the test hanging until the runner's own timeout.
+      const safetyNetMs = WS_REJECTED_SOCKET_GRACE_MS + 5_000;
+      const closed = await waitForRawClose(socket, safetyNetMs);
+      const elapsedMs = Date.now() - start;
 
-    expect(closed).toBe(true);
-    // Must land near the grace period, nowhere near ws's 30s CLOSE_TIMEOUT.
-    expect(elapsedMs).toBeLessThan(WS_REJECTED_SOCKET_GRACE_MS + 3_000);
-  }, 20_000);
+      expect(closed).toBe(true);
+      // Must land near the grace period, nowhere near ws's 30s CLOSE_TIMEOUT.
+      expect(elapsedMs).toBeLessThan(WS_REJECTED_SOCKET_GRACE_MS + 3_000);
+
+      // Server close frames are unmasked. These short reasons fit in the
+      // single-byte payload length, followed by the two-byte close code.
+      const closeFrame = Buffer.concat(chunks);
+      expect(closeFrame[0]).toBe(0x88);
+      expect(closeFrame[1]).toBe(2 + Buffer.byteLength(reason));
+      expect(closeFrame.readUInt16BE(2)).toBe(code);
+      expect(closeFrame.subarray(4).toString('utf8')).toBe(reason);
+    },
+    20_000,
+  );
 });
